@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RPS World</title>
+    <style>
+      html, body { height: 100%; margin: 0; background:#0b1022; color:#e7e8ee; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+      .wrap { display: grid; height: 100%; }
+      canvas { display:block; width:100%; height:100%; background:#0b1022; }
+      .hudTop { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); background: rgba(14,20,48,0.75); border: 1px solid #22294b; color: #e7e8ee; padding: 6px 12px; border-radius: 999px; font-size: 14px; backdrop-filter: blur(4px); }
+      .hudName { position: fixed; top: 8px; left: 50%; transform: translate(-50%, -150%); color: #e7e8ee; font-weight: 600; cursor: pointer; user-select: none; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+      .hudRight { position: fixed; top: 8px; right: 8px; width: 240px; max-height: calc(100% - 16px); overflow: auto; background: rgba(14,20,48,0.75); border: 1px solid #22294b; border-radius: 8px; color: #e7e8ee; font-size: 13px; padding: 8px; backdrop-filter: blur(4px); }
+      .hudRight .title { font-weight: 600; opacity: 0.9; margin-bottom: 6px; }
+      .hudRight .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+      .hudRight .row:last-child { border-bottom: 0; }
+      .hudRight .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hudRight .meta { opacity: 0.7; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <canvas id="game"></canvas>
+    </div>
+    <div id="hudName" class="hudName" title="Click to change your name">Player</div>
+    <div id="hudTop" class="hudTop">Score: 0 • Players: 1</div>
+    <div id="hudRight" class="hudRight">
+      <div class="title">Players</div>
+      <div id="playersList"></div>
+    </div>
+
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/12.5.0/firebase-app.js";
+      import {
+        getDatabase, ref, get, set, update, serverTimestamp,
+        query, orderByKey, startAt, endAt,
+        onChildAdded, onChildChanged, onChildRemoved,
+        off, onValue, onDisconnect
+      } from "https://www.gstatic.com/firebasejs/12.5.0/firebase-database.js";
+      import { getAuth, setPersistence, browserSessionPersistence, signInAnonymously } from "https://www.gstatic.com/firebasejs/12.5.0/firebase-auth.js";
+
+      // Inlined Firebase config to avoid file:// CORS on local import
+      const firebaseConfig = {
+        apiKey: "AIzaSyD-it9Fler4HlYiriRb5F661wL5UMs5X1Y",
+        authDomain: "rpsgame-1e5fb.firebaseapp.com",
+        projectId: "rpsgame-1e5fb",
+        storageBucket: "rpsgame-1e5fb.firebasestorage.app",
+        messagingSenderId: "876435062726",
+        appId: "1:876435062726:web:47d43b51d47368009cbcc7",
+        measurementId: "G-E6ESPD4SYW",
+        databaseURL: "https://rpsgame-1e5fb-default-rtdb.firebaseio.com"
+      };
+      const app = initializeApp(firebaseConfig);
+      const db = getDatabase(app);
+      const auth = getAuth(app);
+      await setPersistence(auth, browserSessionPersistence);
+      await signInAnonymously(auth);
+
+      // World settings
+      const COLS = 1000, ROWS = 1000;    // world dimensions
+      const TILE = 8;                     // tile size in pixels (screen-space before zoom)
+      const PAD = 4;                      // key pad length (0000_0000)
+      const worldRef = ref(db, 'world');
+      const metaRef = ref(db, 'world_meta');
+
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      const hudTopEl = document.getElementById('hudTop');
+      const hudNameEl = document.getElementById('hudName');
+      const hudRightEl = document.getElementById('hudRight');
+      const playersListEl = document.getElementById('playersList');
+
+      // Camera & zoom
+      let scale = 1; // zoom factor
+      let camX = 0, camY = 0; // world-space top-left in tiles
+
+      function onResize() {
+        canvas.width = canvas.clientWidth;
+        canvas.height = canvas.clientHeight;
+      }
+      addEventListener('resize', onResize);
+      onResize();
+
+      canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const dir = Math.sign(e.deltaY);
+        const prev = scale;
+        scale *= dir < 0 ? 1.1 : 0.9;
+        scale = Math.max(0.5, Math.min(6, scale));
+        // zoom towards mouse
+        const mx = e.offsetX, my = e.offsetY;
+        const wx = camX + mx / (TILE * prev);
+        const wy = camY + my / (TILE * prev);
+        camX = wx - mx / (TILE * scale);
+        camY = wy - my / (TILE * scale);
+        camX = Math.max(0, Math.min(COLS - canvas.width/(TILE*scale), camX));
+        camY = Math.max(0, Math.min(ROWS - canvas.height/(TILE*scale), camY));
+        scheduleViewportFetch();
+      }, { passive: false });
+
+      // No mouse painting, camera follows player automatically
+
+      const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+      const pad = (n) => n.toString().padStart(PAD, '0');
+      const keyOf = (x, y) => `${pad(x)}_${pad(y)}`;
+      const checkered = (x, y) => ((x + y) & 1) ? 0x10152d : 0x0d1125;
+      const intToCss = (c) => `#${(c >>> 0).toString(16).padStart(6, '0')}`;
+      // Color jitter utilities to keep within a Euclidean RGB distance
+      function unpackRGB(c){ return { r: (c>>16)&255, g: (c>>8)&255, b: c&255 }; }
+      function packRGB(r,g,b){ return ((r&255)<<16)|((g&255)<<8)|(b&255); }
+      function randInSphere(R){ if(R<=0) return {x:0,y:0,z:0}; while(true){ const x=(Math.random()*2-1)*R, y=(Math.random()*2-1)*R, z=(Math.random()*2-1)*R; if(x*x+y*y+z*z<=R*R) return {x,y,z}; } }
+      function jitterColorRGB(base,maxDist){ const {r,g,b}=unpackRGB(base>>>0); const d=randInSphere(maxDist); const nr=Math.max(0,Math.min(255,Math.round(r+d.x))); const ng=Math.max(0,Math.min(255,Math.round(g+d.y))); const nb=Math.max(0,Math.min(255,Math.round(b+d.z))); return packRGB(nr,ng,nb)>>>0; }
+      function baseColorFor(emoji){ if (emoji==='🪨') return 0xff0000; if (emoji==='📃') return 0x00ff00; return 0x0066ff; }
+      function rid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
+
+      // Local cache of fetched tiles (key -> color int)
+      const tileCache = new Map();
+      function status(t) { /* no-op; previously used HUD */ }
+
+      // Fetch visible tiles and subscribe for live updates per visible column
+      let fetchTimer = null;
+      function scheduleViewportFetch() {
+        if (fetchTimer) return; // debounce to next frame
+        fetchTimer = setTimeout(fetchViewport, 80);
+      }
+
+      async function fetchViewport() {
+        fetchTimer = null;
+        const colsVisible = Math.ceil(canvas.width / (TILE * scale)) + 2;
+        const rowsVisible = Math.ceil(canvas.height / (TILE * scale)) + 2;
+        const x0 = clamp(Math.floor(camX), 0, COLS-1);
+        const y0 = clamp(Math.floor(camY), 0, ROWS-1);
+        const x1 = clamp(x0 + colsVisible, 0, COLS);
+        const y1 = clamp(y0 + rowsVisible, 0, ROWS);
+        status(`Loading tiles ${x0}-${x1-1} x ${y0}-${y1-1}`);
+        const jobs = [];
+        for (let x = x0; x < x1; x++) {
+          const ks = keyOf(x, y0);
+          const ke = keyOf(x, y1 - 1) + "~"; // tilde ensures inclusive upper lexicographic bound
+          const q = query(worldRef, orderByKey(), startAt(ks), endAt(ke));
+          jobs.push(get(q).then((snap) => {
+            const val = snap.val();
+            if (!val) return;
+            for (const [k, v] of Object.entries(val)) tileCache.set(k, v >>> 0);
+          }));
+        }
+        try { await Promise.all(jobs); status('Tiles loaded'); } catch (e) { status('Tile load failed'); console.warn(e); }
+        // Update realtime subscriptions for current viewport
+        ensureRealtimeSubscriptions(x0, x1, y0, y1);
+      }
+
+      // Live update subscriptions per visible column
+      const colSubs = new Map(); // x -> { q, addCb, chgCb }
+      function unsubscribeColumn(x) {
+        const sub = colSubs.get(x);
+        if (!sub) return;
+        try {
+          off(sub.q, 'child_added', sub.addCb);
+          off(sub.q, 'child_changed', sub.chgCb);
+        } catch {}
+        colSubs.delete(x);
+      }
+      function subscribeColumn(x, y0, y1) {
+        const ks = keyOf(x, y0);
+        const ke = keyOf(x, y1 - 1) + "~";
+        const q = query(worldRef, orderByKey(), startAt(ks), endAt(ke));
+        const addCb = (snap) => { const v = snap.val(); if (v != null) tileCache.set(snap.key, v >>> 0); };
+        const chgCb = (snap) => { const v = snap.val(); if (v != null) tileCache.set(snap.key, v >>> 0); };
+        onChildAdded(q, addCb);
+        onChildChanged(q, chgCb);
+        colSubs.set(x, { q, addCb, chgCb });
+      }
+      function ensureRealtimeSubscriptions(x0, x1, y0, y1) {
+        // Remove columns out of range
+        for (const x of Array.from(colSubs.keys())) {
+          if (x < x0 || x >= x1) unsubscribeColumn(x);
+        }
+        // Recreate subscriptions for columns in range (refresh to update y-range)
+        for (let x = x0; x < x1; x++) {
+          if (colSubs.has(x)) unsubscribeColumn(x);
+          subscribeColumn(x, y0, y1);
+        }
+      }
+
+      // Initial: ensure meta node exists (optional heartbeat)
+      try { await update(metaRef, { heartbeat: serverTimestamp(), cols: COLS, rows: ROWS, tile: TILE }); } catch {}
+      // Prime viewport
+      scheduleViewportFetch();
+
+      // Player and movement
+      const EMOJIS = ["📃","🪨","✂️"];
+      const ACCEL = 900;      // px/s^2
+      const MAX_SPEED = 320;  // px/s
+      const RADIUS = 10;      // px, for collision ring
+      // Collision threshold derived from visual radius in tile units
+      const RADIUS_TILES = RADIUS / TILE;
+      const COLLIDE_MULT = 3.5; // increase if hits feel too strict
+      const COLLIDE_TILES = RADIUS_TILES * COLLIDE_MULT; // effective radius in tiles
+
+      const beats = (a, b) => (
+        (a === "📃" && b === "🪨") ||
+        (a === "🪨" && b === "✂️") ||
+        (a === "✂️" && b === "📃")
+      );
+
+      const randLetters5 = () => Array.from({length:5}, () => String.fromCharCode(97 + Math.floor(Math.random()*26))).join("");
+      const randColor = () => {
+        const h = Math.floor(Math.random()*360), s=70, l=55;
+        const c = (1 - Math.abs(2*l/100 - 1)) * (s/100);
+        const x = c * (1 - Math.abs(((h/60)%2) - 1));
+        const m = l/100 - c/2;
+        let r=0,g=0,b=0;
+        if (h<60){ r=c; g=x; b=0; } else if (h<120){ r=x; g=c; b=0; }
+        else if (h<180){ r=0; g=c; b=x; } else if (h<240){ r=0; g=x; b=c; }
+        else if (h<300){ r=x; g=0; b=c; } else { r=c; g=0; b=x; }
+        const R = Math.round((r+m)*255), G = Math.round((g+m)*255), B = Math.round((b+m)*255);
+        return (R<<16)|(G<<8)|B;
+      };
+
+      const me = {
+        id: randLetters5(),
+        emoji: EMOJIS[(Math.random()*EMOJIS.length)|0],
+        x: COLS*0.5, y: ROWS*0.5,
+        vx: 0, vy: 0,
+        color: 0,
+        score: 0,
+        name: ''
+      };
+      // Map of other players (ensure declared before HUD uses it)
+      const others = new Map(); // id -> {x,y,emoji,color,vx,vy}
+      function updateHud() {
+        const playersCount = 1 + others.size;
+        if (hudTopEl) hudTopEl.textContent = `Score: ${me.score} • Players: ${playersCount}`;
+      }
+      function dirArrow(dx, dy) {
+        const a = Math.atan2(dy, dx);
+        const step = Math.PI / 8; // 22.5° sectors
+        const idx = Math.round(((a + Math.PI) / step)) % 16; // 0..15
+        const map = ['←','↖','↖','↑','↑','↗','↗','→','→','↘','↘','↓','↓','↙','↙','←'];
+        return map[idx];
+      }
+      function renderPlayersList() {
+        if (!playersListEl) return;
+        // Build list: me first, then others sorted by name
+        const rows = [];
+        const meLine = `<div class="row"><div class="emoji">${me.emoji}</div><div class="name">${escapeHtml(me.name || ('Player-'+me.id))} (you)</div><div class="meta">(${me.id})</div></div>`;
+        rows.push(meLine);
+        const sorted = Array.from(others.entries()).sort((a,b)=>{
+          const an = (a[1]?.name||'').toLowerCase(); const bn = (b[1]?.name||'').toLowerCase();
+          return an.localeCompare(bn);
+        });
+        for (const [id,p] of sorted) {
+          const px = Number(p.x), py = Number(p.y);
+          const valid = Number.isFinite(px) && Number.isFinite(py);
+          const dx = valid ? (px - me.x) : 0;
+          const dy = valid ? (py - me.y) : 0;
+          const dist = valid ? Math.round(Math.hypot(dx, dy)) : '?';
+          const arrow = valid ? dirArrow(dx, dy) : '·';
+          const line = `<div class="row"><div class="emoji">${p.emoji||'❓'}</div><div class="name">${escapeHtml(p.name || ('Player-'+id))}</div><div class="meta">${arrow} ${dist} • ${id}</div></div>`;
+          rows.push(line);
+        }
+        playersListEl.innerHTML = rows.join('');
+      }
+      function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+      const playersRef = ref(db, 'players');
+      let meRef = null; // will be set after team selection
+
+      // Track other players (child listeners)
+      onChildAdded(playersRef, (snap) => {
+        const id = snap.key; const p = snap.val();
+        if (id === me.id) return;
+        others.set(id, p);
+        console.log(`[players] add ${id} ${p.emoji || '❓'} @ (${p.x}, ${p.y})`);
+        updateHud();
+        renderPlayersList();
+      });
+      onChildChanged(playersRef, (snap) => {
+        const id = snap.key; const p = snap.val();
+        if (id === me.id) return;
+        others.set(id, p);
+        console.log(`[players] chg ${id} ${p.emoji || '❓'} @ (${p.x}, ${p.y})`);
+        updateHud();
+        renderPlayersList();
+      });
+      onChildRemoved(playersRef, (snap) => {
+        console.log(`[players] del ${snap.key}`);
+        others.delete(snap.key);
+        updateHud();
+        renderPlayersList();
+      });
+
+      // Snapshot logger: print all players periodically and on any snapshot
+      function logAllPlayers(val) {
+        const data = val || {};
+        const lines = [];
+        for (const [id, p] of Object.entries(data)) {
+          lines.push(`${id} ${p.emoji || '❓'} @ (${p.x}, ${p.y})`);
+        }
+        console.log('[players] all', lines.length, 'players:', lines);
+      }
+      onValue(playersRef, (snap) => {
+        console.log('[players] onValue snapshot received');
+        const val = snap.val() || {};
+        // Rebuild full set as a fallback to child listeners
+        others.clear();
+        for (const [id, p] of Object.entries(val)) {
+          if (id === me.id) continue;
+          others.set(id, p);
+        }
+        updateHud();
+        renderPlayersList();
+        logAllPlayers(val);
+      });
+      async function fetchAndLogPlayers() {
+        try {
+          console.log('[players] fetch: requesting full snapshot');
+          const s = await get(playersRef);
+          const v = s.val() || {};
+          logAllPlayers(v);
+        } catch (e) {
+          console.warn('[players] fetch failed', e);
+        }
+      }
+      setInterval(fetchAndLogPlayers, 5000);
+
+      // Input
+      const keys = { w:false, a:false, s:false, d:false };
+      const keyMap = { 'w':'w','W':'w','a':'a','A':'a','s':'s','S':'s','d':'d','D':'d','ArrowUp':'w','ArrowLeft':'a','ArrowDown':'s','ArrowRight':'d' };
+      addEventListener('keydown', (e) => { const k = keyMap[e.key]; if (k) { keys[k] = true; e.preventDefault(); } }, { passive:false });
+      addEventListener('keyup',   (e) => { const k = keyMap[e.key]; if (k) { keys[k] = false; e.preventDefault(); } }, { passive:false });
+
+      // Name edit handler
+      if (hudNameEl) {
+        const refreshName = () => { hudNameEl.textContent = me.name || (`Player-${me.id}`); };
+        refreshName();
+        hudNameEl.addEventListener('click', async () => {
+          const raw = prompt('Enter your name (1-20 chars):', me.name || '');
+          if (raw == null) return;
+          const name = String(raw).trim().slice(0, 20);
+          if (!name) return;
+          me.name = name;
+          refreshName();
+          renderPlayersList();
+          try { await update(meRef, { name }); } catch {}
+        });
+      }
+
+      // Initialize own player entry with spawn based on emoji
+      // playersRef already declared above
+      meRef = ref(db, `players/${me.id}`);
+      const jitter = () => (Math.random()*20 - 10);
+      function spawnByEmoji(emoji) {
+        if (emoji === '🪨') { // rock: top-center
+          return { x: clamp(COLS*0.5 + jitter(), 0, COLS-1), y: clamp(20 + jitter(), 0, ROWS-1) };
+        } else if (emoji === '📃') { // paper: bottom-right
+          return { x: clamp(COLS - 20 + jitter(), 0, COLS-1), y: clamp(ROWS - 20 + jitter(), 0, ROWS-1) };
+        } else { // ✂️ scissors: bottom-left
+          return { x: clamp(20 + jitter(), 0, COLS-1), y: clamp(ROWS - 20 + jitter(), 0, ROWS-1) };
+        }
+      }
+      { const s = spawnByEmoji(me.emoji); me.x = s.x; me.y = s.y; }
+      // Assign starting trail color by unit type with slight random jitter
+      me.color = jitterColorRGB(baseColorFor(me.emoji), 100);
+      if (!me.name) me.name = `Player-${me.id}`;
+      await set(meRef, { id: me.id, emoji: me.emoji, x: me.x, y: me.y, vx: me.vx, vy: me.vy, color: me.color, score: me.score, name: me.name, ts: serverTimestamp() });
+      onDisconnect(meRef).remove();
+      updateHud(); renderPlayersList();
+
+      // Collisions inbox: if there is an entry addressed to me, respawn and clear it
+      const myCollRef = ref(db, `collisions/${me.id}`);
+      onChildAdded(myCollRef, (snap) => {
+        const note = snap.val() || {};
+        console.log('[collisions] received for me', note);
+        const j = () => (Math.random()*20 - 10);
+        me.x = clamp(COLS*0.5 + j(), 0, COLS-1);
+        me.y = clamp(ROWS*0.5 + j(), 0, ROWS-1);
+        me.vx = 0; me.vy = 0;
+        me.color = jitterColorRGB(baseColorFor(me.emoji), 100);
+        update(meRef, { x: me.x, y: me.y, vx: 0, vy: 0, color: me.color, ts: serverTimestamp() }).catch(()=>{});
+        set(snap.ref, null).catch((e)=>{ console.warn('[collisions] clear failed', e); });
+      });
+
+      // Loop
+      let last = performance.now();
+      let accSend = 0; let lastPaintKey = '';
+      const collideCooldown = new Map(); // id -> last time (ms)
+      let playing = true;
+      function loop(t) {
+        const dt = Math.min(0.05, (t - last) / 1000); last = t;
+        if (!playing) { draw(); requestAnimationFrame(loop); return; }
+
+        // Acceleration from keys
+        let ax = 0, ay = 0;
+        if (keys.a) ax -= ACCEL; if (keys.d) ax += ACCEL;
+        if (keys.w) ay -= ACCEL; if (keys.s) ay += ACCEL;
+        if (ax && ay) { ax *= Math.SQRT1_2; ay *= Math.SQRT1_2; }
+        me.vx += ax * dt; me.vy += ay * dt;
+        const sp = Math.hypot(me.vx, me.vy);
+        if (sp > MAX_SPEED) { const s = MAX_SPEED/sp; me.vx *= s; me.vy *= s; }
+
+        // Integrate
+        me.x += me.vx * dt / TILE; // convert px/s to tile/s assuming TILE px per tile
+        me.y += me.vy * dt / TILE;
+        // Bounce on world bounds (in tiles)
+        if (me.x < 0) { me.x = 0; me.vx = Math.abs(me.vx); }
+        if (me.x > COLS-1) { me.x = COLS-1; me.vx = -Math.abs(me.vx); }
+        if (me.y < 0) { me.y = 0; me.vy = Math.abs(me.vy); }
+        if (me.y > ROWS-1) { me.y = ROWS-1; me.vy = -Math.abs(me.vy); }
+
+        // Paint current tile
+        const tx = Math.floor(me.x), ty = Math.floor(me.y);
+        const k = keyOf(tx, ty);
+        if (k !== lastPaintKey) {
+          lastPaintKey = k;
+          tileCache.set(k, me.color);
+          set(ref(db, `world/${k}`), me.color).catch(()=>{});
+        }
+
+        // Collisions with others (RPS)
+        const now = performance.now();
+        for (const [id, p] of others) {
+          const ox = Number(p.x) || 0, oy = Number(p.y) || 0;
+          const dx = (ox - me.x), dy = (oy - me.y);
+          if ((dx*dx + dy*dy) <= (COLLIDE_TILES*COLLIDE_TILES)) {
+            const lastHit = collideCooldown.get(id) || 0;
+            if ((now - lastHit) < 900) continue; // 0.9s cooldown per opponent
+            collideCooldown.set(id, now);
+            const oEmoji = p.emoji;
+            // ignore ties (same emoji)
+            if (oEmoji === me.emoji) continue;
+            if (beats(me.emoji, oEmoji)) {
+              me.score += 1;
+              update(meRef, { score: me.score, ts: serverTimestamp() }).catch((e)=>{ console.warn('[score] update failed', e); });
+              // small knockback
+              me.vx = -me.vx; me.vy = -me.vy;
+              updateHud();
+              // Post a collision notice for the loser to react
+              const cid = rid();
+              set(ref(db, `collisions/${id}/${cid}`), { ts: serverTimestamp(), from: me.id, against: id })
+                .catch((e)=>{ console.warn('[collisions] write failed', e); });
+            } else if (beats(oEmoji, me.emoji)) {
+              // Do not immediately respawn self; wait for winner's notice in collisions list
+            }
+          }
+        }
+
+        // Camera follow
+        const viewTilesX = canvas.width / (TILE * scale);
+        const viewTilesY = canvas.height / (TILE * scale);
+        camX = clamp(me.x - viewTilesX*0.5, 0, COLS - viewTilesX);
+        camY = clamp(me.y - viewTilesY*0.5, 0, ROWS - viewTilesY);
+        scheduleViewportFetch();
+
+        // Send state throttled
+        accSend += dt;
+        if (accSend >= 1/12) {
+          accSend = 0;
+          update(meRef, { x: me.x, y: me.y, vx: me.vx, vy: me.vy, ts: serverTimestamp(), emoji: me.emoji, color: me.color, score: me.score }).catch(()=>{});
+        }
+
+        draw();
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      function screenToTile(sx, sy) {
+        const tx = Math.floor(camX + sx / (TILE * scale));
+        const ty = Math.floor(camY + sy / (TILE * scale));
+        return { tx, ty };
+      }
+
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const cols = Math.ceil(canvas.width / (TILE * scale)) + 2;
+        const rows = Math.ceil(canvas.height / (TILE * scale)) + 2;
+        const x0 = clamp(Math.floor(camX), 0, COLS-1);
+        const y0 = clamp(Math.floor(camY), 0, ROWS-1);
+        const x1 = clamp(x0 + cols, 0, COLS);
+        const y1 = clamp(y0 + rows, 0, ROWS);
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            const k = keyOf(x, y);
+            const color = tileCache.has(k) ? tileCache.get(k) : checkered(x, y);
+            ctx.fillStyle = intToCss(color);
+            const sx = Math.floor((x - camX) * TILE * scale);
+            const sy = Math.floor((y - camY) * TILE * scale);
+            const s = Math.ceil(TILE * scale) + 1;
+            ctx.fillRect(sx, sy, s, s);
+          }
+        }
+        // Draw other players
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        for (const [id, p] of others) {
+          const px = Number(p.x); const py = Number(p.y);
+          if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+          const sx = (px - camX) * TILE * scale;
+          const sy = (py - camY) * TILE * scale;
+          // ring
+          ctx.beginPath(); ctx.arc(Math.floor(sx), Math.floor(sy), (RADIUS+4)*scale, 0, Math.PI*2);
+          ctx.strokeStyle = '#7b84f6'; ctx.lineWidth = 2*scale; ctx.stroke();
+          // emoji
+          ctx.font = `${Math.round(22*scale)}px system-ui, apple color emoji, segoe ui emoji`;
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(p.emoji || '❓', Math.floor(sx), Math.floor(sy));
+          // id label
+          ctx.font = `${Math.round(10*scale)}px system-ui, sans-serif`;
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.fillText(id, Math.floor(sx), Math.floor(sy - 16*scale));
+        }
+        // Draw me on top
+        {
+          const sx = (me.x - camX) * TILE * scale;
+          const sy = (me.y - camY) * TILE * scale;
+          ctx.beginPath(); ctx.arc(Math.floor(sx), Math.floor(sy), (RADIUS+6)*scale, 0, Math.PI*2);
+          ctx.strokeStyle = '#7bdff6'; ctx.lineWidth = 3*scale; ctx.stroke();
+          ctx.font = `${Math.round(24*scale)}px system-ui, apple color emoji, segoe ui emoji`;
+          ctx.fillText(me.emoji, Math.floor(sx), Math.floor(sy));
+        }
+        // grid overlay (optional):
+        // ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+        // ctx.lineWidth = 1;
+        // for (let x = x0; x < x1; x++) { const sx = Math.floor((x - camX) * TILE * scale); ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,canvas.height); ctx.stroke(); }
+        // for (let y = y0; y < y1; y++) { const sy = Math.floor((y - camY) * TILE * scale); ctx.beginPath(); ctx.moveTo(0,sy); ctx.lineTo(canvas.width,sy); ctx.stroke(); }
+      }
+    </script>
+  </body>
+  </html>
