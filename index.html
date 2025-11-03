@@ -369,15 +369,31 @@
 
       // Collisions inbox: if there is an entry addressed to me, respawn and clear it
       const myCollRef = ref(db, `collisions/${me.id}`);
-      onChildAdded(myCollRef, (snap) => {
+      onChildAdded(myCollRef, async (snap) => {
         const note = snap.val() || {};
         console.log('[collisions] received for me', note);
-        const j = () => (Math.random()*20 - 10);
-        me.x = clamp(COLS*0.5 + j(), 0, COLS-1);
-        me.y = clamp(ROWS*0.5 + j(), 0, ROWS-1);
+        const killerId = note.from;
+        // Try to infer killer's emoji from local cache first
+        let killerEmoji = (others.get?.(killerId)?.emoji) || null;
+        if (!killerEmoji) {
+          try {
+            const ps = await get(ref(db, `players/${killerId}/emoji`));
+            killerEmoji = ps.val() || null;
+          } catch {}
+        }
+        // If we know killer's emoji, adopt their team and spawn in their area; otherwise fallback to center
+        if (killerEmoji) {
+          me.emoji = killerEmoji;
+          const s = spawnByEmoji(killerEmoji);
+          me.x = s.x; me.y = s.y;
+        } else {
+          const j = () => (Math.random()*20 - 10);
+          me.x = clamp(COLS*0.5 + j(), 0, COLS-1);
+          me.y = clamp(ROWS*0.5 + j(), 0, ROWS-1);
+        }
         me.vx = 0; me.vy = 0;
         me.color = jitterColorRGB(baseColorFor(me.emoji), 100);
-        update(meRef, { x: me.x, y: me.y, vx: 0, vy: 0, color: me.color, ts: serverTimestamp() }).catch(()=>{});
+        update(meRef, { emoji: me.emoji, x: me.x, y: me.y, vx: 0, vy: 0, color: me.color, ts: serverTimestamp() }).catch(()=>{});
         set(snap.ref, null).catch((e)=>{ console.warn('[collisions] clear failed', e); });
       });
 
