@@ -105,12 +105,24 @@
       const keyOf = (x, y) => `${pad(x)}_${pad(y)}`;
       const checkered = (x, y) => ((x + y) & 1) ? 0x10152d : 0x0d1125;
       const intToCss = (c) => `#${(c >>> 0).toString(16).padStart(6, '0')}`;
+      // Normalize world tile payloads into { c: colorInt, n: teamName? }
+      function normTile(v){
+        if (v == null) return null;
+        if (typeof v === 'number') return { c: v >>> 0 };
+        if (typeof v === 'object') {
+          const c = (typeof v.c === 'number') ? (v.c >>> 0) : (typeof v === 'number' ? (v>>>0) : 0);
+          const n = (typeof v.n === 'string') ? v.n : undefined;
+          return { c, n };
+        }
+        return null;
+      }
       // Color jitter utilities to keep within a Euclidean RGB distance
       function unpackRGB(c){ return { r: (c>>16)&255, g: (c>>8)&255, b: c&255 }; }
       function packRGB(r,g,b){ return ((r&255)<<16)|((g&255)<<8)|(b&255); }
       function randInSphere(R){ if(R<=0) return {x:0,y:0,z:0}; while(true){ const x=(Math.random()*2-1)*R, y=(Math.random()*2-1)*R, z=(Math.random()*2-1)*R; if(x*x+y*y+z*z<=R*R) return {x,y,z}; } }
       function jitterColorRGB(base,maxDist){ const {r,g,b}=unpackRGB(base>>>0); const d=randInSphere(maxDist); const nr=Math.max(0,Math.min(255,Math.round(r+d.x))); const ng=Math.max(0,Math.min(255,Math.round(g+d.y))); const nb=Math.max(0,Math.min(255,Math.round(b+d.z))); return packRGB(nr,ng,nb)>>>0; }
       function baseColorFor(emoji){ if (emoji==='🪨') return 0xff0000; if (emoji==='📃') return 0x00ff00; return 0x0066ff; }
+      function teamForEmoji(emoji){ if (emoji==='🪨') return 'rock'; if (emoji==='📃') return 'paper'; return 'scissors'; }
       function rid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 
       // Local cache of fetched tiles (key -> color int)
@@ -141,7 +153,10 @@
           jobs.push(get(q).then((snap) => {
             const val = snap.val();
             if (!val) return;
-            for (const [k, v] of Object.entries(val)) tileCache.set(k, v >>> 0);
+            for (const [k, v] of Object.entries(val)) {
+              const t = normTile(v);
+              if (t) tileCache.set(k, t);
+            }
           }));
         }
         try { await Promise.all(jobs); status('Tiles loaded'); } catch (e) { status('Tile load failed'); console.warn(e); }
@@ -164,8 +179,8 @@
         const ks = keyOf(x, y0);
         const ke = keyOf(x, y1 - 1) + "~";
         const q = query(worldRef, orderByKey(), startAt(ks), endAt(ke));
-        const addCb = (snap) => { const v = snap.val(); if (v != null) tileCache.set(snap.key, v >>> 0); };
-        const chgCb = (snap) => { const v = snap.val(); if (v != null) tileCache.set(snap.key, v >>> 0); };
+        const addCb = (snap) => { const v = snap.val(); const t = normTile(v); if (t) tileCache.set(snap.key, t); };
+        const chgCb = (snap) => { const v = snap.val(); const t = normTile(v); if (t) tileCache.set(snap.key, t); };
         onChildAdded(q, addCb);
         onChildChanged(q, chgCb);
         colSubs.set(x, { q, addCb, chgCb });
@@ -406,14 +421,21 @@
         const dt = Math.min(0.05, (t - last) / 1000); last = t;
         if (!playing) { draw(); requestAnimationFrame(loop); return; }
 
-        // Acceleration from keys
+        // Acceleration from keys (boost if standing on team tile)
+        const tkey = keyOf(Math.floor(me.x), Math.floor(me.y));
+        const tentry = tileCache.get(tkey);
+        const myTeam = teamForEmoji(me.emoji);
+        const onTeamTile = tentry && tentry.n === myTeam || (!tentry && lastPaintKey === tkey);
+        const speedMult = onTeamTile ? 1.3 : 1.0;
+        const accelNow = ACCEL * speedMult;
         let ax = 0, ay = 0;
-        if (keys.a) ax -= ACCEL; if (keys.d) ax += ACCEL;
-        if (keys.w) ay -= ACCEL; if (keys.s) ay += ACCEL;
+        if (keys.a) ax -= accelNow; if (keys.d) ax += accelNow;
+        if (keys.w) ay -= accelNow; if (keys.s) ay += accelNow;
         if (ax && ay) { ax *= Math.SQRT1_2; ay *= Math.SQRT1_2; }
         me.vx += ax * dt; me.vy += ay * dt;
         const sp = Math.hypot(me.vx, me.vy);
-        if (sp > MAX_SPEED) { const s = MAX_SPEED/sp; me.vx *= s; me.vy *= s; }
+        const maxNow = MAX_SPEED * speedMult;
+        if (sp > maxNow) { const s = maxNow/sp; me.vx *= s; me.vy *= s; }
 
         // Integrate
         me.x += me.vx * dt / TILE; // convert px/s to tile/s assuming TILE px per tile
@@ -429,8 +451,9 @@
         const k = keyOf(tx, ty);
         if (k !== lastPaintKey) {
           lastPaintKey = k;
-          tileCache.set(k, me.color);
-          set(ref(db, `world/${k}`), me.color).catch(()=>{});
+          const tileObj = { c: me.color, n: teamForEmoji(me.emoji) };
+          tileCache.set(k, tileObj);
+          set(ref(db, `world/${k}`), tileObj).catch(()=>{});
         }
 
         // Collisions with others (RPS)
@@ -498,7 +521,8 @@
         for (let y = y0; y < y1; y++) {
           for (let x = x0; x < x1; x++) {
             const k = keyOf(x, y);
-            const color = tileCache.has(k) ? tileCache.get(k) : checkered(x, y);
+            const t = tileCache.get(k);
+            const color = t ? t.c : checkered(x, y);
             ctx.fillStyle = intToCss(color);
             const sx = Math.floor((x - camX) * TILE * scale);
             const sy = Math.floor((y - camY) * TILE * scale);
