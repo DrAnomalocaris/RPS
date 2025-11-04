@@ -82,6 +82,12 @@
       let camX = 0, camY = 0; // world-space top-left in tiles
 
       let DPR = 1;
+      function cssSize() {
+        // Derive CSS pixel size from backing store and DPR for consistent math
+        const wcss = (canvas.width || 1) / (DPR || 1);
+        const hcss = (canvas.height || 1) / (DPR || 1);
+        return { wcss, hcss };
+      }
       function onResize() {
         DPR = Math.min(window.devicePixelRatio || 1, 2);
         const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -103,7 +109,7 @@
         const wy = camY + my / (TILE * prev);
         camX = wx - mx / (TILE * scale);
         camY = wy - my / (TILE * scale);
-        const wcss = canvas.clientWidth, hcss = canvas.clientHeight;
+        const { wcss, hcss } = cssSize();
         camX = Math.max(0, Math.min(COLS - wcss/(TILE*scale), camX));
         camY = Math.max(0, Math.min(ROWS - hcss/(TILE*scale), camY));
         scheduleViewportFetch();
@@ -130,7 +136,7 @@
           const wy = camY + pinchCenter.y / (TILE * prev);
           camX = wx - pinchCenter.x / (TILE * scale);
           camY = wy - pinchCenter.y / (TILE * scale);
-          const wcss = canvas.clientWidth, hcss = canvas.clientHeight;
+          const { wcss, hcss } = cssSize();
           camX = clamp(camX, 0, COLS - wcss/(TILE*scale));
           camY = clamp(camY, 0, ROWS - hcss/(TILE*scale));
           pinchPrevDist = dist;
@@ -588,8 +594,9 @@
         }
 
         // Camera follow
-        const viewTilesX = canvas.clientWidth / (TILE * scale);
-        const viewTilesY = canvas.clientHeight / (TILE * scale);
+        const { wcss, hcss } = cssSize();
+        const viewTilesX = wcss / (TILE * scale);
+        const viewTilesY = hcss / (TILE * scale);
         camX = clamp(me.x - viewTilesX*0.5, 0, COLS - viewTilesX);
         camY = clamp(me.y - viewTilesY*0.5, 0, ROWS - viewTilesY);
         scheduleViewportFetch();
@@ -617,8 +624,9 @@
         // Set device pixel ratio transform for crisp rendering
         ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const cols = Math.ceil(canvas.clientWidth / (TILE * scale)) + 2;
-        const rows = Math.ceil(canvas.clientHeight / (TILE * scale)) + 2;
+        const { wcss: dw, hcss: dh } = cssSize();
+        const cols = Math.ceil(dw / (TILE * scale)) + 2;
+        const rows = Math.ceil(dh / (TILE * scale)) + 2;
         const x0 = clamp(Math.floor(camX), 0, COLS-1);
         const y0 = clamp(Math.floor(camY), 0, ROWS-1);
         const x1 = clamp(x0 + cols, 0, COLS);
